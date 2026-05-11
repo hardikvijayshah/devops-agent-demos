@@ -1,0 +1,1119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS DevOps Agent - Serverless Application Troubleshooting Workshop.
+  Deploys an order processing serverless application with API Gateway, Lambda,
+  Step Functions, DynamoDB, EventBridge, SQS, and SNS. Includes CloudWatch
+  alarms for DevOps Agent investigation.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: devops-agent-serverless
+    Description: Prefix for all resource names
+    AllowedPattern: '[a-z0-9-]+'
+    MaxLength: 30
+
+  EnvironmentTag:
+    Type: String
+    Default: workshop
+    AllowedValues:
+      - workshop
+      - dev
+      - staging
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-orders'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: Workshop
+          Value: serverless-troubleshooting
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-inventory'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: Workshop
+          Value: serverless-troubleshooting
+
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-payments'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: Workshop
+          Value: serverless-troubleshooting
+
+  # ============================================================
+  # SQS Dead Letter Queue
+  # ============================================================
+
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-order-dlq'
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # SNS Topic for Notifications
+  # ============================================================
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-notifications'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alarms'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ============================================================
+  # EventBridge Custom Event Bus
+  # ============================================================
+
+  OrderEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ResourcePrefix}-order-events'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  OrderCompletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-order-completed'
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - 'order.service'
+        detail-type:
+          - 'OrderCompleted'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref NotificationTopic
+          Id: NotifyOnCompletion
+          InputTransformer:
+            InputPathsMap:
+              orderId: '$.detail.orderId'
+              status: '$.detail.status'
+            InputTemplate: '"Order <orderId> completed with status: <status>"'
+
+  OrderCompletedRuleTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt OrderCompletedRule.Arn
+
+  OrderFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-order-failed'
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - 'order.service'
+        detail-type:
+          - 'OrderFailed'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrderDLQ.Arn
+          Id: DLQOnFailure
+
+  OrderFailedRuleQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderDLQ.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt OrderFailedRule.Arn
+
+  # ============================================================
+  # IAM Role for Lambda Functions
+  # ============================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt InventoryTable.Arn
+                  - !GetAtt PaymentsTable.Arn
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-order-workflow'
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !GetAtt OrderEventBus.Arn
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref NotificationTopic
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+
+  OrderApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-order-api'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ResourcePrefix}-order-workflow'
+          ENVIRONMENT: !Ref EnvironmentTag
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import time
+          import boto3
+
+          sfn_client = boto3.client('stepfunctions')
+          dynamodb = boto3.resource('dynamodb')
+          orders_table = dynamodb.Table(os.environ['ORDERS_TABLE'])
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+
+                  order_id = str(uuid.uuid4())
+                  order = {
+                      'orderId': order_id,
+                      'customerId': body.get('customerId', 'anonymous'),
+                      'items': body.get('items', []),
+                      'totalAmount': body.get('totalAmount', 0),
+                      'status': 'RECEIVED',
+                      'createdAt': int(time.time())
+                  }
+
+                  orders_table.put_item(Item=order)
+
+                  sfn_client.start_execution(
+                      stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                      name=f'order-{order_id}',
+                      input=json.dumps(order)
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'message': 'Order received',
+                          'orderId': order_id,
+                          'status': 'RECEIVED'
+                      })
+                  }
+              except Exception as e:
+                  print(f'Error processing order: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ValidateOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-validate-order'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          inventory_table = dynamodb.Table(os.environ['INVENTORY_TABLE'])
+
+          def handler(event, context):
+              order = event
+              items = order.get('items', [])
+
+              if not items:
+                  raise ValueError('Order must contain at least one item')
+
+              if order.get('totalAmount', 0) <= 0:
+                  raise ValueError('Order total must be greater than zero')
+
+              for item in items:
+                  product_id = item.get('productId')
+                  quantity = item.get('quantity', 0)
+
+                  response = inventory_table.get_item(Key={'productId': product_id})
+                  product = response.get('Item')
+
+                  if not product:
+                      raise ValueError(f'Product {product_id} not found')
+
+                  if int(product.get('stockCount', 0)) < quantity:
+                      raise ValueError(f'Insufficient stock for product {product_id}')
+
+              return {
+                  **order,
+                  'validated': True
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ProcessPaymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-process-payment'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          PAYMENTS_TABLE: !Ref PaymentsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import time
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          payments_table = dynamodb.Table(os.environ['PAYMENTS_TABLE'])
+
+          def handler(event, context):
+              order = event
+              payment_id = str(uuid.uuid4())
+
+              payment = {
+                  'paymentId': payment_id,
+                  'orderId': order['orderId'],
+                  'amount': str(order['totalAmount']),
+                  'status': 'COMPLETED',
+                  'processedAt': int(time.time())
+              }
+
+              payments_table.put_item(Item=payment)
+
+              return {
+                  **order,
+                  'paymentId': payment_id,
+                  'paymentStatus': 'COMPLETED'
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  UpdateInventoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-update-inventory'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          inventory_table = dynamodb.Table(os.environ['INVENTORY_TABLE'])
+
+          def handler(event, context):
+              order = event
+              items = order.get('items', [])
+
+              for item in items:
+                  product_id = item.get('productId')
+                  quantity = item.get('quantity', 0)
+
+                  inventory_table.update_item(
+                      Key={'productId': product_id},
+                      UpdateExpression='SET stockCount = stockCount - :qty',
+                      ExpressionAttributeValues={':qty': quantity},
+                      ConditionExpression='stockCount >= :qty'
+                  )
+
+              return {
+                  **order,
+                  'inventoryUpdated': True
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  SendNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-send-notification'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          events_client = boto3.client('events')
+          sns_client = boto3.client('sns')
+
+          def handler(event, context):
+              order = event
+              order_id = order['orderId']
+
+              events_client.put_events(
+                  Entries=[{
+                      'Source': 'order.service',
+                      'DetailType': 'OrderCompleted',
+                      'Detail': json.dumps({
+                          'orderId': order_id,
+                          'customerId': order.get('customerId'),
+                          'status': 'COMPLETED',
+                          'paymentId': order.get('paymentId')
+                      }),
+                      'EventBusName': os.environ['EVENT_BUS_NAME']
+                  }]
+              )
+
+              sns_client.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject=f'Order {order_id} Completed',
+                  Message=json.dumps({
+                      'orderId': order_id,
+                      'status': 'COMPLETED',
+                      'customerId': order.get('customerId')
+                  })
+              )
+
+              return {
+                  **order,
+                  'notificationSent': True,
+                  'status': 'COMPLETED'
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # Lambda Log Groups
+  # ============================================================
+
+  OrderApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-order-api'
+      RetentionInDays: 7
+
+  ValidateOrderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-validate-order'
+      RetentionInDays: 7
+
+  ProcessPaymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-process-payment'
+      RetentionInDays: 7
+
+  UpdateInventoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-update-inventory'
+      RetentionInDays: 7
+
+  SendNotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-send-notification'
+      RetentionInDays: 7
+
+  # ============================================================
+  # Step Functions State Machine
+  # ============================================================
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ValidateOrderFunction.Arn
+                  - !GetAtt ProcessPaymentFunction.Arn
+                  - !GetAtt UpdateInventoryFunction.Arn
+                  - !GetAtt SendNotificationFunction.Arn
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !GetAtt OrderEventBus.Arn
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  OrderWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ResourcePrefix}-order-workflow'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+      DefinitionString: !Sub |
+        {
+          "Comment": "Order processing workflow",
+          "StartAt": "ValidateOrder",
+          "States": {
+            "ValidateOrder": {
+              "Type": "Task",
+              "Resource": "${ValidateOrderFunction.Arn}",
+              "Next": "ProcessPayment",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "OrderFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "${ProcessPaymentFunction.Arn}",
+              "Next": "UpdateInventory",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "OrderFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "UpdateInventory": {
+              "Type": "Task",
+              "Resource": "${UpdateInventoryFunction.Arn}",
+              "Next": "SendNotification",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "OrderFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "${SendNotificationFunction.Arn}",
+              "Next": "OrderSucceeded",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "OrderFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "OrderSucceeded": {
+              "Type": "Succeed"
+            },
+            "OrderFailed": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::events:putEvents",
+              "Parameters": {
+                "Entries": [
+                  {
+                    "Source": "order.service",
+                    "DetailType": "OrderFailed",
+                    "Detail": {
+                      "orderId.$": "$.orderId",
+                      "error.$": "$.error"
+                    },
+                    "EventBusName": "${OrderEventBus}"
+                  }
+                ]
+              },
+              "Next": "FailState"
+            },
+            "FailState": {
+              "Type": "Fail",
+              "Error": "OrderProcessingFailed",
+              "Cause": "One or more steps in the order workflow failed"
+            }
+          }
+        }
+
+  # ============================================================
+  # API Gateway
+  # ============================================================
+
+  OrderApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ResourcePrefix}-api'
+      Description: Order Processing API for DevOps Agent Workshop
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  OrderResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrderApi
+      ParentId: !GetAtt OrderApi.RootResourceId
+      PathPart: orders
+
+  OrderPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrderApi
+      ResourceId: !Ref OrderResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderApiFunction.Arn}/invocations'
+
+  OrderGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrderApi
+      ResourceId: !Ref OrderResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderApiFunction.Arn}/invocations'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OrderPostMethod
+      - OrderGetMethod
+    Properties:
+      RestApiId: !Ref OrderApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref OrderApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: true
+          LoggingLevel: INFO
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrderApi}/*'
+
+  ApiGatewayLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-apigw-log-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # ============================================================
+  # Seed Data Lambda (Custom Resource)
+  # ============================================================
+
+  SeedDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-seed-data'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import cfnresponse
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  table = dynamodb.Table(os.environ['INVENTORY_TABLE'])
+                  products = [
+                      {'productId': 'PROD-001', 'name': 'Wireless Headphones', 'price': 79, 'stockCount': 500},
+                      {'productId': 'PROD-002', 'name': 'USB-C Cable', 'price': 15, 'stockCount': 1000},
+                      {'productId': 'PROD-003', 'name': 'Laptop Stand', 'price': 45, 'stockCount': 300},
+                      {'productId': 'PROD-004', 'name': 'Mechanical Keyboard', 'price': 120, 'stockCount': 200},
+                      {'productId': 'PROD-005', 'name': 'Monitor Light Bar', 'price': 55, 'stockCount': 150},
+                  ]
+                  for product in products:
+                      table.put_item(Item=product)
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'ProductCount': str(len(products))})
+              except Exception as e:
+                  print(f'Error seeding data: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  SeedDataCustomResource:
+    Type: Custom::SeedData
+    DependsOn:
+      - InventoryTable
+    Properties:
+      ServiceToken: !GetAtt SeedDataFunction.Arn
+
+  # ============================================================
+  # CloudWatch Alarms
+  # ============================================================
+
+  OrderApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-order-api-errors'
+      AlarmDescription: Order API Lambda function errors detected
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderApiFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  OrderApiDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-order-api-duration'
+      AlarmDescription: Order API Lambda function duration too high
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderApiFunction
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-sfn-failures'
+      AlarmDescription: Step Functions workflow execution failures
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref OrderWorkflowStateMachine
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-dynamodb-throttle'
+      AlarmDescription: DynamoDB write throttling on inventory table
+      Namespace: AWS/DynamoDB
+      MetricName: WriteThrottleEvents
+      Dimensions:
+        - Name: TableName
+          Value: !Ref InventoryTable
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-api-5xx-errors'
+      AlarmDescription: API Gateway 5xx errors detected
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ResourcePrefix}-api'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ApiGatewayLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-api-latency'
+      AlarmDescription: API Gateway latency too high
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ResourcePrefix}-api'
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-dlq-messages'
+      AlarmDescription: Messages appearing in Dead Letter Queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ValidateOrderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-validate-order-errors'
+      AlarmDescription: Validate Order Lambda function errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ValidateOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+# ============================================================
+# Outputs
+# ============================================================
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders'
+
+  OrdersTableName:
+    Description: DynamoDB Orders table name
+    Value: !Ref OrdersTable
+
+  InventoryTableName:
+    Description: DynamoDB Inventory table name
+    Value: !Ref InventoryTable
+
+  PaymentsTableName:
+    Description: DynamoDB Payments table name
+    Value: !Ref PaymentsTable
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref OrderWorkflowStateMachine
+
+  EventBusName:
+    Description: EventBridge custom event bus name
+    Value: !Ref OrderEventBus
+
+  DLQUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref OrderDLQ
+
+  OrderApiFunctionName:
+    Description: Order API Lambda function name
+    Value: !Ref OrderApiFunction
+
+  ValidateOrderFunctionName:
+    Description: Validate Order Lambda function name
+    Value: !Ref ValidateOrderFunction
+
+  ProcessPaymentFunctionName:
+    Description: Process Payment Lambda function name
+    Value: !Ref ProcessPaymentFunction
+
+  UpdateInventoryFunctionName:
+    Description: Update Inventory Lambda function name
+    Value: !Ref UpdateInventoryFunction
+
+  SendNotificationFunctionName:
+    Description: Send Notification Lambda function name
+    Value: !Ref SendNotificationFunction
+
+  AlarmTopicArn:
+    Description: SNS topic ARN for alarm notifications
+    Value: !Ref AlarmNotificationTopic
+
+  StackPrefix:
+    Description: Resource prefix used for this deployment
+    Value: !Ref ResourcePrefix

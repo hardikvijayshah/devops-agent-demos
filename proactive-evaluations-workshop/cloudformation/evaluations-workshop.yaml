@@ -1,0 +1,1007 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS DevOps Agent - Proactive Evaluations Workshop.
+  Deploys intentionally under-monitored and misconfigured infrastructure
+  to demonstrate DevOps Agent's Evaluation (prevention) capabilities.
+  Includes observability gaps, missing auto-scaling, lenient alarm thresholds,
+  and deployment pipeline weaknesses for the agent to discover.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: devops-eval
+    Description: Prefix for all resource names
+    AllowedPattern: '[a-z0-9-]+'
+    MaxLength: 20
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for alarm notifications
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+
+  # ============================================================
+  # VPC & Networking (intentionally minimal - no redundancy)
+  # ============================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc'
+        - Key: devopsagent
+          Value: 'true'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-igw'
+        - Key: devopsagent
+          Value: 'true'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-1'
+        - Key: devopsagent
+          Value: 'true'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-2'
+        - Key: devopsagent
+          Value: 'true'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-rt'
+        - Key: devopsagent
+          Value: 'true'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group - HTTP access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-alb-sg'
+        - Key: devopsagent
+          Value: 'true'
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-app-sg'
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # DynamoDB Tables (intentionally underprovisioned)
+  # GAP: No CloudWatch alarms on ConsumedWriteCapacityUnits
+  # GAP: Low provisioned throughput without auto-scaling
+  # ============================================================
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-orders'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-inventory'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 3
+        WriteCapacityUnits: 3
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-sessions'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 10
+        WriteCapacityUnits: 10
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # Lambda Functions (intentionally misconfigured)
+  # GAP: No reserved concurrency
+  # GAP: No dead letter queue
+  # GAP: No X-Ray tracing
+  # GAP: Timeout too generous (allows silent hangs)
+  # ============================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+                  - !GetAtt InventoryTable.Arn
+                  - !GetAtt SessionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-order-processor'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          INVENTORY_TABLE: !Ref InventoryTable
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import uuid
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          orders_table = dynamodb.Table(os.environ['ORDERS_TABLE'])
+          inventory_table = dynamodb.Table(os.environ['INVENTORY_TABLE'])
+
+          def handler(event, context):
+              body = json.loads(event.get('body', '{}'))
+              order_id = str(uuid.uuid4())
+
+              # No input validation (gap: application resilience)
+              customer_id = body['customerId']
+              items = body['items']
+              total = body['totalAmount']
+
+              # Write order - no retry logic (gap: resilience)
+              orders_table.put_item(Item={
+                  'orderId': order_id,
+                  'customerId': customer_id,
+                  'items': items,
+                  'totalAmount': Decimal(str(total)),
+                  'status': 'RECEIVED',
+                  'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ')
+              })
+
+              # Check inventory with full table scan (gap: performance)
+              for item in items:
+                  result = inventory_table.scan(
+                      FilterExpression='productId = :pid',
+                      ExpressionAttributeValues={':pid': item['productId']}
+                  )
+                  if not result['Items']:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Product {item["productId"]} not found'})
+                      }
+
+              # Update order status - no error handling
+              orders_table.update_item(
+                  Key={'orderId': order_id},
+                  UpdateExpression='SET #s = :s',
+                  ExpressionAttributeNames={'#s': 'status'},
+                  ExpressionAttributeValues={':s': 'PROCESSING'}
+              )
+
+              # Publish notification - no DLQ for failures
+              sns.publish(
+                  TopicArn=os.environ['NOTIFICATION_TOPIC'],
+                  Message=json.dumps({'orderId': order_id, 'status': 'PROCESSING'}),
+                  Subject='Order Received'
+              )
+
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'orderId': order_id, 'status': 'PROCESSING'})
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  InventoryCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-inventory-checker'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['INVENTORY_TABLE'])
+
+          def handler(event, context):
+              # Full table scan every invocation (gap: inefficient query)
+              # No pagination handling (gap: will fail on large tables)
+              result = table.scan()
+              items = result['Items']
+
+              low_stock = []
+              for item in items:
+                  if int(item.get('stock', 0)) < 10:
+                      low_stock.append({
+                          'productId': item['productId'],
+                          'name': item.get('name', 'Unknown'),
+                          'stock': int(item.get('stock', 0))
+                      })
+
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'totalProducts': len(items),
+                      'lowStockItems': low_stock,
+                      'lowStockCount': len(low_stock)
+                  })
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  SessionCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-session-cleanup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 128
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['SESSIONS_TABLE'])
+
+          def handler(event, context):
+              # Scans entire table to find expired sessions
+              # Gap: TTL already enabled - this function is redundant
+              # Gap: No pagination - will timeout on large tables
+              # Gap: No error handling for partial failures
+              cutoff = int(time.time()) - 86400  # 24 hours ago
+
+              result = table.scan(
+                  FilterExpression='#t < :cutoff',
+                  ExpressionAttributeNames={'#t': 'ttl'},
+                  ExpressionAttributeValues={':cutoff': cutoff}
+              )
+
+              deleted = 0
+              for item in result['Items']:
+                  table.delete_item(Key={'sessionId': item['sessionId']})
+                  deleted += 1
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Cleaned up {deleted} expired sessions',
+                      'scanned': result['Count']
+                  })
+              }
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # API Gateway (no throttling, no WAF, no caching)
+  # GAP: No usage plan or API key
+  # GAP: No request validation
+  # GAP: No caching
+  # ============================================================
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ResourcePrefix}-api'
+      Description: Order processing API (intentionally under-protected)
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: orders
+
+  InventoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: inventory
+
+  OrderPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderProcessorFunction.Arn}/invocations'
+
+  InventoryGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref InventoryResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InventoryCheckerFunction.Arn}/invocations'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OrderPostMethod
+      - InventoryGetMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  OrderApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  InventoryApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InventoryCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  # ============================================================
+  # ALB + Auto Scaling (no scaling policy - single fixed size)
+  # GAP: No target tracking scaling policy
+  # GAP: No scheduled scaling
+  # GAP: Fixed desired capacity = min capacity
+  # ============================================================
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ResourcePrefix}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ResourcePrefix}-tg'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ResourcePrefix}-lt'
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum install -y python3.12 python3.12-pip
+            pip3.12 install flask gunicorn boto3
+
+            cat > /opt/app.py << 'APPEOF'
+            from flask import Flask, jsonify
+            import time
+            import socket
+
+            app = Flask(__name__)
+            start_time = time.time()
+
+            @app.route('/health')
+            def health():
+                return jsonify({
+                    'status': 'healthy',
+                    'uptime': int(time.time() - start_time),
+                    'hostname': socket.gethostname()
+                })
+
+            @app.route('/')
+            def root():
+                return jsonify({
+                    'service': 'Evaluations Workshop App',
+                    'hostname': socket.gethostname()
+                })
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=8080)
+            APPEOF
+
+            cat > /etc/systemd/system/webapp.service << 'SVCEOF'
+            [Unit]
+            Description=Web Application
+            After=network.target
+
+            [Service]
+            ExecStart=/usr/bin/python3.12 -m gunicorn -w 2 -b 0.0.0.0:8080 app:app
+            WorkingDirectory=/opt
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
+
+            systemctl daemon-reload
+            systemctl enable webapp
+            systemctl start webapp
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ResourcePrefix}-app'
+              - Key: devopsagent
+                Value: 'true'
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ResourcePrefix}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+          PropagateAtLaunch: true
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ResourcePrefix}-ec2-profile'
+      Roles:
+        - !Ref EC2Role
+
+  # ============================================================
+  # SNS Topic (no encryption, no access policy restriction)
+  # ============================================================
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-notifications'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alarms'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ============================================================
+  # EventBridge Rule (scheduled inventory check - no error handling)
+  # ============================================================
+
+  InventoryCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-inventory-check'
+      Description: Periodic inventory check (every 5 minutes)
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Id: InventoryChecker
+          Arn: !GetAtt InventoryCheckerFunction.Arn
+
+  InventoryCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InventoryCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InventoryCheckRule.Arn
+
+  SessionCleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-session-cleanup'
+      Description: Daily session cleanup
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Id: SessionCleanup
+          Arn: !GetAtt SessionCleanupFunction.Arn
+
+  SessionCleanupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SessionCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SessionCleanupRule.Arn
+
+  # ============================================================
+  # CloudWatch Alarms (intentionally incomplete and lenient)
+  # GAP: No alarm on DynamoDB ConsumedWriteCapacityUnits
+  # GAP: No alarm on DynamoDB ThrottledRequests
+  # GAP: No alarm on Lambda Duration
+  # GAP: No alarm on Lambda ConcurrentExecutions
+  # GAP: No alarm on ALB TargetResponseTime
+  # GAP: No alarm on ALB RequestCount (traffic anomaly)
+  # Only 3 alarms (should have 10+)
+  # ============================================================
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-errors'
+      AlarmDescription: Lambda function errors (threshold too lenient)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ALBUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-alb-unhealthy'
+      AlarmDescription: ALB unhealthy hosts
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt ALBTargetGroup.TargetGroupFullName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  API5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-api-5xx'
+      AlarmDescription: API Gateway 5xx errors (threshold too lenient)
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ResourcePrefix}-api'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  # ============================================================
+  # CloudWatch Log Groups
+  # ============================================================
+
+  OrderProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-order-processor'
+      RetentionInDays: 7
+
+  InventoryCheckerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-inventory-checker'
+      RetentionInDays: 7
+
+  SessionCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-session-cleanup'
+      RetentionInDays: 7
+
+  # ============================================================
+  # Seed Data Custom Resource
+  # ============================================================
+
+  SeedDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-seed-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBSeed
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt InventoryTable.Arn
+                  - !GetAtt SessionsTable.Arn
+
+  SeedDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-seed-data'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SeedDataRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import os
+          import time
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  dynamodb = boto3.resource('dynamodb')
+                  inv_table = dynamodb.Table(os.environ['INVENTORY_TABLE'])
+                  sessions_table = dynamodb.Table(os.environ['SESSIONS_TABLE'])
+
+                  products = [
+                      {'productId': 'PROD-001', 'name': 'Wireless Headphones', 'price': 79, 'stock': 500, 'category': 'electronics'},
+                      {'productId': 'PROD-002', 'name': 'USB-C Cable', 'price': 15, 'stock': 1000, 'category': 'accessories'},
+                      {'productId': 'PROD-003', 'name': 'Laptop Stand', 'price': 45, 'stock': 300, 'category': 'accessories'},
+                      {'productId': 'PROD-004', 'name': 'Mechanical Keyboard', 'price': 120, 'stock': 200, 'category': 'electronics'},
+                      {'productId': 'PROD-005', 'name': 'Monitor Light Bar', 'price': 55, 'stock': 150, 'category': 'electronics'},
+                      {'productId': 'PROD-006', 'name': 'Webcam HD', 'price': 65, 'stock': 8, 'category': 'electronics'},
+                      {'productId': 'PROD-007', 'name': 'Mouse Pad XL', 'price': 25, 'stock': 5, 'category': 'accessories'},
+                      {'productId': 'PROD-008', 'name': 'HDMI Cable', 'price': 12, 'stock': 3, 'category': 'accessories'},
+                  ]
+
+                  for product in products:
+                      inv_table.put_item(Item=product)
+
+                  # Seed expired sessions (for cleanup function to find)
+                  now = int(time.time())
+                  for i in range(20):
+                      sessions_table.put_item(Item={
+                          'sessionId': f'sess-expired-{i:03d}',
+                          'userId': f'user-{i % 5}',
+                          'ttl': now - 172800,  # 2 days ago
+                          'data': 'expired session data'
+                      })
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ProductsSeeded': str(len(products)),
+                      'SessionsSeeded': '20'
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+          SESSIONS_TABLE: !Ref SessionsTable
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  SeedDataCustomResource:
+    Type: Custom::SeedData
+    DependsOn:
+      - InventoryTable
+      - SessionsTable
+    Properties:
+      ServiceToken: !GetAtt SeedDataFunction.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  ALBEndpoint:
+    Description: ALB DNS endpoint
+    Value: !Sub 'http://${ALB.DNSName}'
+  OrdersTableName:
+    Description: DynamoDB Orders table
+    Value: !Ref OrdersTable
+  InventoryTableName:
+    Description: DynamoDB Inventory table
+    Value: !Ref InventoryTable
+  SessionsTableName:
+    Description: DynamoDB Sessions table
+    Value: !Ref SessionsTable
+  OrderProcessorFunction:
+    Description: Order processor Lambda function
+    Value: !Ref OrderProcessorFunction
+  InventoryCheckerFunction:
+    Description: Inventory checker Lambda function
+    Value: !Ref InventoryCheckerFunction
+  SessionCleanupFunction:
+    Description: Session cleanup Lambda function
+    Value: !Ref SessionCleanupFunction
+  AutoScalingGroupName:
+    Description: Auto Scaling Group name
+    Value: !Ref AutoScalingGroup
+  AlarmTopicArn:
+    Description: SNS topic for alarm notifications
+    Value: !Ref AlarmNotificationTopic

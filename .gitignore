@@ -1,0 +1,29 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# AWS
+.aws-sam/
+packaged.yaml
+samconfig.toml
+
+# Claude Code
+.claude/
+
+# Temp
+*.tmp
+*.zip

@@ -1,0 +1,1103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS DevOps Agent - CI/CD Pipeline Failure Investigation Workshop.
+  Deploys a CodePipeline with CodeBuild and CodeDeploy targeting EC2
+  instances behind an ALB. Includes CloudWatch alarms for DevOps Agent
+  investigation of pipeline failures.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: devops-agent-cicd
+    Description: Prefix for all resource names
+    AllowedPattern: '[a-z0-9-]+'
+    MaxLength: 30
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type for application servers
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+
+  # ============================================================
+  # VPC and Networking
+  # ============================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc'
+        - Key: devopsagent
+          Value: 'true'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-alb-sg'
+        - Key: devopsagent
+          Value: 'true'
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Instance Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-ec2-sg'
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # Application Load Balancer
+  # ============================================================
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ResourcePrefix}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ResourcePrefix}-tg'
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-codedeploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-pipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt TestProject.Arn
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentConfig
+                Resource: '*'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # S3 Artifact Bucket
+  # ============================================================
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # EC2 Auto Scaling Group
+  # ============================================================
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ResourcePrefix}-lt'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ResourcePrefix}-app'
+              - Key: devopsagent
+                Value: 'true'
+              - Key: Workshop
+                Value: cicd-pipeline
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            # Install dependencies
+            dnf install -y python3.12 python3.12-pip ruby wget
+
+            # Install CodeDeploy agent
+            cd /tmp
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl enable codedeploy-agent
+            systemctl start codedeploy-agent
+
+            # Create application directory
+            mkdir -p /opt/webapp
+            chown ec2-user:ec2-user /opt/webapp
+
+            # Signal ready
+            echo "Instance initialization complete" > /opt/webapp/init.log
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ResourcePrefix}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+          PropagateAtLaunch: true
+
+  # ============================================================
+  # CodeBuild Projects
+  # ============================================================
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ResourcePrefix}-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-build.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: workshop
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ResourcePrefix}-test'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-test.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # CodeDeploy
+  # ============================================================
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ResourcePrefix}-app'
+      ComputePlatform: Server
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ResourcePrefix}-dg'
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      AutoScalingGroups:
+        - !Ref AutoScalingGroup
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+      AlarmConfiguration:
+        Alarms:
+          - Name: !Ref ALBUnhealthyAlarm
+        Enabled: true
+
+  # ============================================================
+  # CodePipeline
+  # ============================================================
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ResourcePrefix}-pipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: source/app.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Test
+          Actions:
+            - Name: TestAction
+              ActionTypeId:
+                Category: Test
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref TestProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: TestOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref DeploymentGroup
+              InputArtifacts:
+                - Name: BuildOutput
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # SNS Topic
+  # ============================================================
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alarms'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-pipeline-notifications'
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  # ============================================================
+  # Pipeline Notification Rule
+  # ============================================================
+
+  PipelineNotificationRule:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-pipeline-notifications'
+      Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+      DetailType: FULL
+      EventTypeIds:
+        - codepipeline-pipeline-pipeline-execution-failed
+        - codepipeline-pipeline-pipeline-execution-succeeded
+        - codepipeline-pipeline-stage-execution-failed
+      Targets:
+        - TargetType: SNS
+          TargetAddress: !Ref PipelineNotificationTopic
+      Tags:
+        devopsagent: 'true'
+
+  # ============================================================
+  # Application Source Packager (Custom Resource)
+  # ============================================================
+
+  SourcePackagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-packager-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Upload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+
+  SourcePackagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-source-packager'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SourcePackagerRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import io
+          import zipfile
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+
+          APP_PY = '''
+          from flask import Flask, jsonify, request
+          import time
+          import os
+          import socket
+
+          app = Flask(__name__)
+          start_time = time.time()
+
+          @app.route('/health')
+          def health():
+              return jsonify({
+                  'status': 'healthy',
+                  'uptime': time.time() - start_time,
+                  'hostname': socket.gethostname(),
+                  'version': os.environ.get('APP_VERSION', '1.0.0')
+              })
+
+          @app.route('/')
+          def index():
+              return jsonify({
+                  'service': 'DevOps Agent CI/CD Workshop',
+                  'version': os.environ.get('APP_VERSION', '1.0.0'),
+                  'hostname': socket.gethostname()
+              })
+
+          @app.route('/api/status')
+          def status():
+              return jsonify({
+                  'status': 'operational',
+                  'uptime': time.time() - start_time,
+                  'version': os.environ.get('APP_VERSION', '1.0.0')
+              })
+
+          @app.route('/api/process', methods=['POST'])
+          def process():
+              data = request.get_json(silent=True) or {}
+              return jsonify({
+                  'processed': True,
+                  'input': data,
+                  'hostname': socket.gethostname()
+              })
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=5000)
+          '''
+
+          REQUIREMENTS_TXT = '''flask==3.1.1
+          gunicorn==23.0.0
+          '''
+
+          TEST_APP_PY = '''
+          import unittest
+          import json
+          import sys
+          sys.path.insert(0, '.')
+          from app import app
+
+          class TestApp(unittest.TestCase):
+              def setUp(self):
+                  self.client = app.test_client()
+
+              def test_health(self):
+                  response = self.client.get('/health')
+                  self.assertEqual(response.status_code, 200)
+                  data = json.loads(response.data)
+                  self.assertEqual(data['status'], 'healthy')
+
+              def test_index(self):
+                  response = self.client.get('/')
+                  self.assertEqual(response.status_code, 200)
+                  data = json.loads(response.data)
+                  self.assertIn('service', data)
+
+              def test_status(self):
+                  response = self.client.get('/api/status')
+                  self.assertEqual(response.status_code, 200)
+                  data = json.loads(response.data)
+                  self.assertEqual(data['status'], 'operational')
+
+              def test_process(self):
+                  response = self.client.post('/api/process',
+                      data=json.dumps({'key': 'value'}),
+                      content_type='application/json')
+                  self.assertEqual(response.status_code, 200)
+                  data = json.loads(response.data)
+                  self.assertTrue(data['processed'])
+
+          if __name__ == '__main__':
+              unittest.main()
+          '''
+
+          BUILDSPEC_BUILD = '''version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - pip install -r requirements.txt
+            build:
+              commands:
+                - echo "Building application..."
+                - python -m py_compile app.py
+                - echo "Build successful"
+            post_build:
+              commands:
+                - echo "Build completed on $(date)"
+          artifacts:
+            files:
+              - '**/*'
+          '''
+
+          BUILDSPEC_TEST = '''version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - pip install -r requirements.txt
+            build:
+              commands:
+                - echo "Running tests..."
+                - python -m pytest tests/ -v --tb=short 2>/dev/null || python -m unittest discover -s tests -v
+                - echo "All tests passed"
+          artifacts:
+            files:
+              - '**/*'
+          '''
+
+          APPSPEC = '''version: 0.0
+          os: linux
+          files:
+            - source: /
+              destination: /opt/webapp
+          hooks:
+            AfterInstall:
+              - location: scripts/install_dependencies.sh
+                timeout: 120
+                runas: root
+            ApplicationStart:
+              - location: scripts/start_server.sh
+                timeout: 60
+                runas: root
+            ValidateService:
+              - location: scripts/validate_service.sh
+                timeout: 60
+                runas: root
+          '''
+
+          INSTALL_DEPS = '''#!/bin/bash
+          set -e
+          cd /opt/webapp
+          pip3.12 install -r requirements.txt
+          '''
+
+          START_SERVER = '''#!/bin/bash
+          set -e
+          # Stop existing server if running
+          pkill -f gunicorn || true
+          sleep 2
+          cd /opt/webapp
+          export APP_VERSION="1.0.0"
+          nohup gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 30 app:app > /var/log/webapp.log 2>&1 &
+          sleep 3
+          # Verify server started
+          curl -sf http://localhost:5000/health || exit 1
+          echo "Server started successfully"
+          '''
+
+          VALIDATE_SERVICE = '''#!/bin/bash
+          set -e
+          sleep 5
+          for i in {1..10}; do
+              if curl -sf http://localhost:5000/health > /dev/null 2>&1; then
+                  echo "Service validation passed (attempt $i)"
+                  exit 0
+              fi
+              echo "Waiting for service... (attempt $i)"
+              sleep 3
+          done
+          echo "Service validation failed"
+          exit 1
+          '''
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+
+                  zip_buffer = io.BytesIO()
+                  with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                      zf.writestr('app.py', APP_PY.strip())
+                      zf.writestr('requirements.txt', REQUIREMENTS_TXT.strip())
+                      zf.writestr('tests/test_app.py', TEST_APP_PY.strip())
+                      zf.writestr('buildspec-build.yml', BUILDSPEC_BUILD.strip())
+                      zf.writestr('buildspec-test.yml', BUILDSPEC_TEST.strip())
+                      zf.writestr('appspec.yml', APPSPEC.strip())
+                      zf.writestr('scripts/install_dependencies.sh', INSTALL_DEPS.strip())
+                      zf.writestr('scripts/start_server.sh', START_SERVER.strip())
+                      zf.writestr('scripts/validate_service.sh', VALIDATE_SERVICE.strip())
+
+                  zip_buffer.seek(0)
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key='source/app.zip',
+                      Body=zip_buffer.getvalue()
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': 'Source code packaged and uploaded'
+                  })
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Tags:
+        - Key: devopsagent
+          Value: 'true'
+
+  PackageSourceCode:
+    Type: Custom::PackageSource
+    DependsOn:
+      - ArtifactBucket
+    Properties:
+      ServiceToken: !GetAtt SourcePackagerFunction.Arn
+      BucketName: !Ref ArtifactBucket
+
+  # ============================================================
+  # CloudWatch Alarms
+  # ============================================================
+
+  ALBUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-alb-unhealthy'
+      AlarmDescription: ALB target unhealthy host count
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt ALBTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ALB5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-alb-5xx'
+      AlarmDescription: ALB 5xx error rate
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ALBLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-alb-latency'
+      AlarmDescription: ALB target response time too high
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-build-failures'
+      AlarmDescription: CodeBuild build project failures
+      Namespace: AWS/CodeBuild
+      MetricName: FailedBuilds
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref BuildProject
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  TestFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-test-failures'
+      AlarmDescription: CodeBuild test project failures
+      Namespace: AWS/CodeBuild
+      MetricName: FailedBuilds
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref TestProject
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-pipeline-failures'
+      AlarmDescription: CodePipeline execution failures
+      Namespace: AWS/CodePipeline
+      MetricName: PipelineExecutionFailure
+      Dimensions:
+        - Name: PipelineName
+          Value: !Ref Pipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-cpu-utilization'
+      AlarmDescription: EC2 CPU utilization too high
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  DeploymentFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-deploy-failures'
+      AlarmDescription: CodeDeploy deployment failures
+      Namespace: AWS/CodeDeploy
+      MetricName: DeploymentFailure
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+# ============================================================
+# Outputs
+# ============================================================
+
+Outputs:
+  ALBEndpoint:
+    Description: Application Load Balancer DNS name
+    Value: !Sub 'http://${ALB.DNSName}'
+
+  PipelineName:
+    Description: CodePipeline name
+    Value: !Ref Pipeline
+
+  PipelineConsoleUrl:
+    Description: CodePipeline console URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view'
+
+  BuildProjectName:
+    Description: CodeBuild build project name
+    Value: !Ref BuildProject
+
+  TestProjectName:
+    Description: CodeBuild test project name
+    Value: !Ref TestProject
+
+  CodeDeployApplicationName:
+    Description: CodeDeploy application name
+    Value: !Ref CodeDeployApplication
+
+  DeploymentGroupName:
+    Description: CodeDeploy deployment group name
+    Value: !Ref DeploymentGroup
+
+  ArtifactBucketName:
+    Description: S3 artifact bucket name
+    Value: !Ref ArtifactBucket
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group name
+    Value: !Ref AutoScalingGroup
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  CodeBuildRoleArn:
+    Description: CodeBuild IAM role ARN
+    Value: !GetAtt CodeBuildRole.Arn
+
+  StackPrefix:
+    Description: Resource prefix used for this deployment
+    Value: !Ref ResourcePrefix
