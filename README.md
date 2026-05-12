@@ -1,6 +1,19 @@
 # AWS DevOps Agent - Demo Workshops
 
-Three production-grade, hands-on workshops demonstrating AWS DevOps Agent's full spectrum of capabilities -- reactive incident investigation AND proactive prevention. Each workshop deploys realistic application infrastructure with 5 scenarios that showcase how DevOps Agent correlates telemetry, code changes, and configuration drift to identify root causes and prevent future incidents.
+Four production-grade, hands-on workshops demonstrating AWS DevOps Agent's full spectrum of capabilities -- reactive incident investigation AND proactive prevention. Each workshop deploys realistic application infrastructure with failure scenarios that showcase how DevOps Agent correlates telemetry, code changes, and configuration drift to identify root causes and prevent future incidents.
+
+---
+
+## Individual Workshop Repositories
+
+Each workshop is also available as a standalone repo:
+
+| Workshop | Repository | Description |
+|----------|-----------|-------------|
+| CI/CD Pipeline | [devops-agent-cicd-pipeline-workshop](https://github.com/hardikvijayshah/devops-agent-cicd-pipeline-workshop) | CodePipeline + CodeBuild + CodeDeploy failure investigation |
+| Serverless | [devops-agent-serverless-workshop](https://github.com/hardikvijayshah/devops-agent-serverless-workshop) | Lambda + Step Functions + DynamoDB + EventBridge troubleshooting |
+| Proactive Evaluations | [devops-agent-proactive-evaluations-workshop](https://github.com/hardikvijayshah/devops-agent-proactive-evaluations-workshop) | Prevention mode - observability, capacity, resilience, security |
+| Jenkins + ECS | [devops-agent-jenkins-ecs-workshop](https://github.com/hardikvijayshah/devops-agent-jenkins-ecs-workshop) | Jenkins CI/CD + ECS Fargate deployment failure investigation |
 
 ---
 

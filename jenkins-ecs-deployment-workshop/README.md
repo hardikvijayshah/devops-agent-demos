@@ -100,8 +100,8 @@ Simulates a memory leak where the application gradually consumes all available m
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd jenkins-ecs-deployment-workshop
+git clone https://github.com/hardikvijayshah/devops-agent-jenkins-ecs-workshop.git
+cd devops-agent-jenkins-ecs-workshop
 
 # Deploy everything (takes 10-15 minutes)
 ./scripts/deploy.sh devops-agent-jenkins your-email@example.com
