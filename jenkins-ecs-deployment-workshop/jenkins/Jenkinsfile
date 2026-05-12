@@ -1,0 +1,240 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION      = "${params.AWS_REGION ?: 'us-east-1'}"
+        ECR_REPO        = "${params.ECR_REPO}"
+        ECS_CLUSTER     = "${params.ECS_CLUSTER}"
+        ECS_SERVICE     = "${params.ECS_SERVICE}"
+        APP_VERSION     = "${BUILD_NUMBER}.${GIT_COMMIT?.take(7) ?: 'manual'}"
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        STACK_PREFIX    = "${params.STACK_PREFIX ?: 'devops-agent-jenkins'}"
+    }
+
+    parameters {
+        string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'AWS Region')
+        string(name: 'ECR_REPO', defaultValue: '', description: 'ECR Repository URI')
+        string(name: 'ECS_CLUSTER', defaultValue: 'devops-agent-jenkins-cluster', description: 'ECS Cluster Name')
+        string(name: 'ECS_SERVICE', defaultValue: 'devops-agent-jenkins-service', description: 'ECS Service Name')
+        string(name: 'STACK_PREFIX', defaultValue: 'devops-agent-jenkins', description: 'CloudFormation stack prefix')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out source code..."
+                checkout scm
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo "Building Docker image version ${APP_VERSION}..."
+                dir('app') {
+                    sh """
+                        docker build \
+                            --build-arg APP_VERSION=${APP_VERSION} \
+                            --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                            --build-arg COMMIT_SHA=${GIT_COMMIT ?: 'unknown'} \
+                            -t ${ECR_REPO}:${IMAGE_TAG} \
+                            -t ${ECR_REPO}:latest \
+                            .
+                    """
+                }
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                echo "Running container health check test..."
+                sh """
+                    docker run -d --name test-container -p 9090:8080 ${ECR_REPO}:${IMAGE_TAG}
+                    sleep 5
+
+                    # Health check
+                    HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9090/health)
+                    if [ "\${HTTP_CODE}" != "200" ]; then
+                        echo "Health check failed with HTTP \${HTTP_CODE}"
+                        docker logs test-container
+                        docker rm -f test-container
+                        exit 1
+                    fi
+
+                    echo "Health check passed (HTTP 200)"
+                    docker rm -f test-container
+                """
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                echo "Pushing image to ECR..."
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REPO}
+
+                    docker push ${ECR_REPO}:${IMAGE_TAG}
+                    docker push ${ECR_REPO}:latest
+                """
+            }
+        }
+
+        stage('Deploy to ECS') {
+            steps {
+                echo "Deploying to ECS Fargate..."
+                sh """
+                    # Get current task definition
+                    TASK_DEF=\$(aws ecs describe-services \
+                        --cluster ${ECS_CLUSTER} \
+                        --services ${ECS_SERVICE} \
+                        --region ${AWS_REGION} \
+                        --query 'services[0].taskDefinition' \
+                        --output text)
+
+                    echo "Current task definition: \${TASK_DEF}"
+
+                    # Register new task definition with updated image
+                    NEW_TASK_DEF=\$(aws ecs describe-task-definition \
+                        --task-definition \${TASK_DEF} \
+                        --region ${AWS_REGION} \
+                        --query 'taskDefinition' | \
+                        jq --arg IMAGE "${ECR_REPO}:${IMAGE_TAG}" \
+                           --arg VERSION "${APP_VERSION}" \
+                           --arg BUILD "${BUILD_NUMBER}" \
+                           --arg TIME "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        '.containerDefinitions[0].image = \$IMAGE |
+                         .containerDefinitions[0].environment = [
+                            {"name": "APP_VERSION", "value": \$VERSION},
+                            {"name": "BUILD_NUMBER", "value": \$BUILD},
+                            {"name": "DEPLOY_TIME", "value": \$TIME},
+                            {"name": "ENVIRONMENT", "value": "production"},
+                            {"name": "AWS_REGION", "value": "${AWS_REGION}"}
+                         ]' | \
+                        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+                    NEW_TASK_ARN=\$(echo \${NEW_TASK_DEF} | \
+                        aws ecs register-task-definition \
+                            --region ${AWS_REGION} \
+                            --cli-input-json "file:///dev/stdin" \
+                            --query 'taskDefinition.taskDefinitionArn' \
+                            --output text)
+
+                    echo "New task definition: \${NEW_TASK_ARN}"
+
+                    # Update service with new task definition
+                    aws ecs update-service \
+                        --cluster ${ECS_CLUSTER} \
+                        --service ${ECS_SERVICE} \
+                        --task-definition \${NEW_TASK_ARN} \
+                        --region ${AWS_REGION} \
+                        --force-new-deployment > /dev/null
+
+                    echo "Deployment initiated. Waiting for service stability..."
+                """
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                echo "Waiting for ECS service to stabilize..."
+                sh """
+                    # Wait for service to reach steady state (up to 10 minutes)
+                    aws ecs wait services-stable \
+                        --cluster ${ECS_CLUSTER} \
+                        --services ${ECS_SERVICE} \
+                        --region ${AWS_REGION} || {
+                        echo "ERROR: Service did not stabilize within timeout!"
+                        echo "Checking service events..."
+                        aws ecs describe-services \
+                            --cluster ${ECS_CLUSTER} \
+                            --services ${ECS_SERVICE} \
+                            --region ${AWS_REGION} \
+                            --query 'services[0].events[0:5].[createdAt,message]' \
+                            --output table
+                        exit 1
+                    }
+
+                    echo "Service is stable. Verifying health via ALB..."
+
+                    # Get ALB endpoint
+                    ALB_DNS=\$(aws elbv2 describe-load-balancers \
+                        --names ${STACK_PREFIX}-alb \
+                        --region ${AWS_REGION} \
+                        --query 'LoadBalancers[0].DNSName' \
+                        --output text)
+
+                    # Verify health endpoint
+                    for i in \$(seq 1 5); do
+                        HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' \
+                            "http://\${ALB_DNS}/health" --max-time 10)
+                        if [ "\${HTTP_CODE}" = "200" ]; then
+                            echo "Deployment verified successfully (HTTP 200 from ALB)"
+                            curl -s "http://\${ALB_DNS}/api/info" | jq .
+                            exit 0
+                        fi
+                        echo "Waiting for healthy response... (attempt \${i}/5, HTTP \${HTTP_CODE})"
+                        sleep 10
+                    done
+
+                    echo "ERROR: Application health check failed after deployment!"
+                    exit 1
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployment successful! Version ${APP_VERSION} is live."
+            sh """
+                aws sns publish \
+                    --topic-arn \$(aws cloudformation describe-stacks \
+                        --stack-name ${STACK_PREFIX} \
+                        --query 'Stacks[0].Outputs[?OutputKey==`DeploymentTopicArn`].OutputValue' \
+                        --output text --region ${AWS_REGION}) \
+                    --subject "Deployment SUCCESS: ${APP_VERSION}" \
+                    --message "Build #${BUILD_NUMBER} deployed successfully to ECS. Version: ${APP_VERSION}" \
+                    --region ${AWS_REGION} 2>/dev/null || true
+            """
+        }
+
+        failure {
+            echo "Deployment FAILED! Initiating rollback investigation..."
+            sh """
+                echo "======================================"
+                echo "DEPLOYMENT FAILURE - ROLLBACK TRIGGERED"
+                echo "======================================"
+                echo "Build: #${BUILD_NUMBER}"
+                echo "Image: ${ECR_REPO}:${IMAGE_TAG}"
+                echo ""
+                echo "ECS Deployment Circuit Breaker will auto-rollback."
+                echo "DevOps Agent will be notified via CloudWatch Events."
+                echo ""
+
+                # Publish failure notification
+                aws sns publish \
+                    --topic-arn \$(aws cloudformation describe-stacks \
+                        --stack-name ${STACK_PREFIX} \
+                        --query 'Stacks[0].Outputs[?OutputKey==`DeploymentTopicArn`].OutputValue' \
+                        --output text --region ${AWS_REGION}) \
+                    --subject "Deployment FAILED: ${APP_VERSION}" \
+                    --message "Build #${BUILD_NUMBER} FAILED deployment to ECS. Image: ${ECR_REPO}:${IMAGE_TAG}. DevOps Agent investigation triggered." \
+                    --region ${AWS_REGION} 2>/dev/null || true
+
+                # Log failure details for DevOps Agent
+                echo "Fetching ECS service events..."
+                aws ecs describe-services \
+                    --cluster ${ECS_CLUSTER} \
+                    --services ${ECS_SERVICE} \
+                    --region ${AWS_REGION} \
+                    --query 'services[0].events[0:10].[createdAt,message]' \
+                    --output table 2>/dev/null || true
+            """
+        }
+
+        always {
+            sh 'docker rm -f test-container 2>/dev/null || true'
+            cleanWs()
+        }
+    }
+}

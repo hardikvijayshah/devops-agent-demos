@@ -1,0 +1,320 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DevOps Agent Integration - Lambda webhook bridge that connects
+  CloudWatch Alarms and EventBridge rules to AWS DevOps Agent.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: devops-agent-jenkins
+    Description: Must match the main workshop stack prefix
+
+  WebhookUrl:
+    Type: String
+    Description: DevOps Agent Webhook URL (from Agent Space > Capabilities > Webhooks)
+    NoEcho: true
+
+  WebhookSecret:
+    Type: String
+    Description: DevOps Agent Webhook HMAC Secret Key
+    NoEcho: true
+
+Resources:
+
+  # ============================================================
+  # Lambda Execution Role
+  # ============================================================
+
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-webhook-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:DescribeAlarmHistory
+                Resource: '*'
+
+  # ============================================================
+  # Lambda Function - CloudWatch Alarm Webhook Bridge
+  # ============================================================
+
+  AlarmWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-alarm-webhook'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Ref WebhookUrl
+          WEBHOOK_SECRET: !Ref WebhookSecret
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import hmac
+          import hashlib
+          import base64
+          import urllib3
+          from datetime import datetime
+
+          http = urllib3.PoolManager()
+          WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+          WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET')
+
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              try:
+                  alarm_name = event.get('alarmData', {}).get('alarmName', 'Unknown')
+                  alarm_description = event.get('alarmData', {}).get('configuration', {}).get('description') or ''
+                  new_state = event.get('alarmData', {}).get('state', {}).get('value', 'ALARM')
+                  reason = event.get('alarmData', {}).get('state', {}).get('reason', '')
+                  timestamp = event.get('alarmData', {}).get('state', {}).get('timestamp', datetime.utcnow().isoformat())
+                  region = event.get('region', 'us-east-1')
+                  account_id = event.get('accountId', '')
+
+                  if new_state != 'ALARM':
+                      return {'statusCode': 200, 'body': 'Not in ALARM state, skipping'}
+
+                  metrics = event.get('alarmData', {}).get('configuration', {}).get('metrics', [])
+                  metric_info = ""
+                  if metrics:
+                      metric = metrics[0].get('metricStat', {}).get('metric', {})
+                      metric_info = f"\nMetric: {metric.get('namespace', '')}/{metric.get('name', '')}"
+                      dims = metric.get('dimensions', {})
+                      if dims:
+                          metric_info += f"\nDimensions: {dims}"
+
+                  description = f"CloudWatch Alarm: {alarm_name}\n"
+                  description += f"AWS Account: {account_id}\nRegion: {region}\n"
+                  description += f"State: {new_state}\nReason: {reason}"
+                  if alarm_description:
+                      description += f"\nDescription: {alarm_description}"
+                  description += metric_info
+
+                  payload = {
+                      "eventType": "incident",
+                      "incidentId": f"{alarm_name}-{timestamp}",
+                      "action": "created",
+                      "priority": "HIGH",
+                      "title": f"CloudWatch Alarm: {alarm_name}",
+                      "description": description,
+                      "timestamp": timestamp,
+                      "service": alarm_name,
+                      "data": {"metadata": {"alarmName": alarm_name, "region": region, "accountId": account_id, "newState": new_state, "reason": reason, "alarmArn": event.get('alarmArn', ''), "metrics": metrics}}
+                  }
+
+                  payload_json = json.dumps(payload)
+                  event_timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+                  signature_string = f"{event_timestamp}:{payload_json}"
+                  signature = hmac.new(WEBHOOK_SECRET.encode('utf-8'), signature_string.encode('utf-8'), hashlib.sha256).digest()
+                  signature_b64 = base64.b64encode(signature).decode('utf-8')
+
+                  headers = {'Content-Type': 'application/json', 'x-amzn-event-timestamp': event_timestamp, 'x-amzn-event-signature': signature_b64}
+                  response = http.request('POST', WEBHOOK_URL, body=payload_json, headers=headers)
+                  print(f"Webhook response: {response.status} - {response.data.decode('utf-8')}")
+
+                  if response.status in [200, 202]:
+                      return {'statusCode': 200, 'body': 'Investigation triggered'}
+                  else:
+                      raise Exception(f"Webhook failed: {response.status}")
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  # ============================================================
+  # Lambda Function - EventBridge ECS Task Webhook Bridge
+  # ============================================================
+
+  EventBridgeWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-eventbridge-webhook'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Ref WebhookUrl
+          WEBHOOK_SECRET: !Ref WebhookSecret
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import hmac
+          import hashlib
+          import base64
+          import urllib3
+          from datetime import datetime
+
+          http = urllib3.PoolManager()
+          WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+          WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET')
+
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              try:
+                  detail = event.get('detail', {})
+                  detail_type = event.get('detail-type', '')
+
+                  # Handle ECS Deployment State Change
+                  if detail_type == 'ECS Deployment State Change':
+                      event_name = detail.get('eventName', '')
+                      deployment_id = detail.get('deploymentId', 'Unknown')
+                      reason = detail.get('reason', '')
+                      title = f"ECS Deployment Failed: {deployment_id}"
+                      description = f"ECS Deployment State Change\nEvent: {event_name}\nDeployment: {deployment_id}\nReason: {reason}"
+
+                  # Handle ECS Task State Change
+                  elif detail_type == 'ECS Task State Change':
+                      task_arn = detail.get('taskArn', 'Unknown')
+                      cluster_arn = detail.get('clusterArn', 'Unknown')
+                      stopped_reason = detail.get('stoppedReason', '')
+                      stop_code = detail.get('stopCode', '')
+                      containers = detail.get('containers', [])
+                      container_info = ""
+                      for c in containers:
+                          container_info += f"\n  - {c.get('name', '?')}: {c.get('lastStatus', '?')}"
+                          if c.get('reason'):
+                              container_info += f" ({c.get('reason')})"
+
+                      title = f"ECS Task Failed: {task_arn.split('/')[-1]}"
+                      description = f"ECS Task State Change\nTask: {task_arn}\nCluster: {cluster_arn}\nStop Code: {stop_code}\nReason: {stopped_reason}"
+                      if container_info:
+                          description += f"\nContainers:{container_info}"
+                  else:
+                      title = f"AWS Event: {detail_type}"
+                      description = json.dumps(event, indent=2)[:2000]
+
+                  payload = {
+                      "eventType": "incident",
+                      "incidentId": f"{title}-{datetime.utcnow().isoformat()}",
+                      "action": "created",
+                      "priority": "HIGH",
+                      "title": title,
+                      "description": description,
+                      "timestamp": datetime.utcnow().isoformat(),
+                      "service": "ecs",
+                      "data": {"metadata": detail}
+                  }
+
+                  payload_json = json.dumps(payload, default=str)
+                  event_timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+                  signature_string = f"{event_timestamp}:{payload_json}"
+                  signature = hmac.new(WEBHOOK_SECRET.encode('utf-8'), signature_string.encode('utf-8'), hashlib.sha256).digest()
+                  signature_b64 = base64.b64encode(signature).decode('utf-8')
+
+                  headers = {'Content-Type': 'application/json', 'x-amzn-event-timestamp': event_timestamp, 'x-amzn-event-signature': signature_b64}
+                  response = http.request('POST', WEBHOOK_URL, body=payload_json, headers=headers)
+                  print(f"Webhook response: {response.status} - {response.data.decode('utf-8')}")
+
+                  if response.status in [200, 202]:
+                      return {'statusCode': 200, 'body': 'Investigation triggered'}
+                  else:
+                      raise Exception(f"Webhook failed: {response.status}")
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  # ============================================================
+  # Lambda Permissions (allow alarms and EventBridge to invoke)
+  # ============================================================
+
+  AlarmLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlarmWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+
+  EventBridgeDeployPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventBridgeWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeployFailureLambdaRule.Arn
+
+  EventBridgeTaskPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventBridgeWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TaskStoppedLambdaRule.Arn
+
+  # ============================================================
+  # EventBridge Rules targeting Lambda (instead of SNS)
+  # ============================================================
+
+  DeployFailureLambdaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-deploy-fail-to-agent'
+      Description: Routes ECS deployment failures to DevOps Agent via Lambda webhook
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Deployment State Change
+        detail:
+          eventName:
+            - SERVICE_DEPLOYMENT_FAILED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventBridgeWebhookFunction.Arn
+          Id: DeployFailToAgent
+
+  TaskStoppedLambdaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-task-stop-to-agent'
+      Description: Routes ECS task failures to DevOps Agent via Lambda webhook
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - ECS Task State Change
+        detail:
+          lastStatus:
+            - STOPPED
+          stopCode:
+            - TaskFailedToStart
+            - EssentialContainerExited
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventBridgeWebhookFunction.Arn
+          Id: TaskStopToAgent
+
+Outputs:
+  AlarmWebhookFunctionArn:
+    Description: ARN of the Lambda that bridges CloudWatch Alarms to DevOps Agent
+    Value: !GetAtt AlarmWebhookFunction.Arn
+
+  EventBridgeWebhookFunctionArn:
+    Description: ARN of the Lambda that bridges EventBridge events to DevOps Agent
+    Value: !GetAtt EventBridgeWebhookFunction.Arn
+
+  NextStep:
+    Description: Add Lambda action to your CloudWatch Alarms
+    Value: !Sub 'Update alarms to invoke ${AlarmWebhookFunction.Arn} as a Lambda action when in ALARM state'
